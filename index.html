@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>회로 시뮬레이터 (전지 + 캡 + 게이트)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0f1115; color: #e5e7eb; overflow: hidden; user-select: none;
+  }
+  #toolbar {
+    position: fixed; top: 0; left: 0; right: 0; min-height: 52px;
+    background: #1a1d24; border-bottom: 1px solid #2d3139;
+    display: flex; align-items: center; gap: 6px; padding: 0 12px; z-index: 10;
+    overflow-x: auto; flex-wrap: wrap;
+  }
+  .mode { display:flex; gap:4px; padding: 3px; background:#0f1115; border-radius:8px; flex-shrink:0; }
+  .mode button {
+    background: transparent; color:#9ca3af; border:none; padding:6px 12px;
+    border-radius:6px; cursor:pointer; font-size:13px; font-weight:600;
+  }
+  .mode button.active { background:#2563eb; color:#fff; }
+  .sep { width:1px; height:28px; background:#2d3139; margin:0 4px; flex-shrink:0; }
+  .group-label { font-size:11px; color:#6b7280; padding:0 4px; font-weight:600; text-transform:uppercase; }
+  .btn {
+    background:#252932; color:#d1d5db; border:1px solid #353a45;
+    padding:6px 10px; border-radius:6px; cursor:pointer; font-size:12px;
+    white-space:nowrap; transition: all 0.12s; font-family: ui-monospace, monospace;
+  }
+  .btn:hover { background:#2f3540; border-color:#4b5563; }
+  .btn.active { background:#2563eb; border-color:#3b82f6; color:#fff; }
+  .btn.special { border-color:#a855f7; }
+  .btn.special.active { background:#7c3aed; border-color:#a855f7; }
+  .btn.danger { background:#7f1d1d; border-color:#991b1b; }
+  .btn.danger:hover { background:#991b1b; }
+  #canvas { display:block; cursor: crosshair; }
+  #status {
+    position:fixed; bottom:10px; left:10px;
+    background:rgba(15,17,21,0.9); border:1px solid #2d3139;
+    padding:6px 12px; border-radius:6px; font:11px ui-monospace,monospace;
+    color:#4ade80; pointer-events:none; white-space:pre;
+  }
+  #hint {
+    position:fixed; bottom:10px; right:10px;
+    background:rgba(15,17,21,0.9); border:1px solid #2d3139;
+    padding:6px 12px; border-radius:6px; font:11px ui-monospace,monospace;
+    color:#9ca3af; pointer-events:none; max-width:380px; text-align:right;
+  }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <div class="mode">
+    <button data-mode="circuit" class="active">🔌 회로</button>
+    <button data-mode="logic">⚡ 논리</button>
+  </div>
+  <div class="sep"></div>
+  <div id="tools"></div>
+  <div class="sep"></div>
+  <button class="btn danger" id="clearBtn">🗑 전체 삭제</button>
+</div>
+
+<canvas id="canvas"></canvas>
+<div id="status">준비</div>
+<div id="hint"></div>
+
+<script>
+// ============================================================
+// 상태
+// ============================================================
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const hintEl = document.getElementById('hint');
+
+let W, H;
+function resize() {
+  W = canvas.width = innerWidth;
+  H = canvas.height = innerHeight;
+  draw();
+}
+addEventListener('resize', resize);
+
+const state = {
+  mode: 'circuit',
+  tool: 'select',
+  nodes: [],
+  comps: [],
+  selected: null,
+  drag: null,
+  wireStart: null,
+  sim: { currents: {}, voltages: null, nodeVal: {} },
+  clock: false,
+  t: 0,
+};
+
+const GRID = 24;
+const snap = v => Math.round(v / GRID) * GRID;
+
+// ============================================================
+// 노드/부품
+// ============================================================
+function nodeAt(x, y) {
+  const sx = snap(x), sy = snap(y);
+  return state.nodes.findIndex(n => n.x === sx && n.y === sy);
+}
+function ensureNode(x, y) {
+  const idx = nodeAt(x, y);
+  if (idx >= 0) return idx;
+  state.nodes.push({ x: snap(x), y: snap(y) });
+  return state.nodes.length - 1;
+}
+let compId = 0;
+function addComp(type, x, y) {
+  const c = {
+    id: ++compId,
+    type, x: snap(x), y: snap(y),
+    n: [],
+    val: 100,
+    closed: false,
+    out: false,
+    prevClk: false,
+    state: 0, // FSM 상태
+    lit: 0,
+    segBits: 0,
+  };
+  if (type === 'resistor') c.val = 100;
+  if (type === 'battery' || type === 'vsource') c.val = 5;
+  if (type === 'led') c.val = 2.0;
+  state.comps.push(c);
+  return c;
+}
+
+// ============================================================
+// 게이트 정의
+// ============================================================
+const GATE_DEFS = {
+  // 기본
+  and:  { inputs: 2, kind: 'basic' },
+  or:   { inputs: 2, kind: 'basic' },
+  not:  { inputs: 1, kind: 'basic' },
+  nand: { inputs: 2, kind: 'basic' },
+  nor:  { inputs: 2, kind: 'basic' },
+  xor:  { inputs: 2, kind: 'basic' },
+  xnor: { inputs: 2, kind: 'basic' },
+  // 특수
+  buf:    { inputs: 1, kind: 'special' }, // 버퍼
+  and3:   { inputs: 3, kind: 'special' },
+  or3:    { inputs: 3, kind: 'special' },
+  nand3:  { inputs: 3, kind: 'special' },
+  nor3:   { inputs: 3, kind: 'special' },
+  xor3:   { inputs: 3, kind: 'special' },
+  tri:    { inputs: 2, kind: 'special' }, // 3-state buffer (data, enable)
+  dff:    { inputs: 2, kind: 'special' }, // D, CLK
+  tff:    { inputs: 2, kind: 'special' }, // T, CLK
+  jkff:   { inputs: 3, kind: 'special' }, // J, K, CLK
+  sr:     { inputs: 2, kind: 'special' }, // S, R
+  seg7:   { inputs: 4, kind: 'special' }, // 4bit → 7-segment
+};
+const isGate = t => t in GATE_DEFS;
+const isLogicType = t => isGate(t) || t === 'input' || t === 'led';
+
+function terminalCount(t) {
+  if (t === 'input') return 1;
+  if (isGate(t)) {
+    const def = GATE_DEFS[t];
+    // 입력 수 + 출력 1
+    return def.inputs + 1;
+  }
+  return 2; // 2단자 부품
+}
+
+// 단자 위치 (로컬)
+function terminals(c) {
+  const x = c.x, y = c.y;
+  if (isGate(c.type)) {
+    const def = GATE_DEFS[c.type];
+    const n = def.inputs;
+    const out = [{ x: x + 32, y }];
+    const ins = [];
+    const spacing = 20;
+    const startY = y - ((n - 1) * spacing) / 2;
+    for (let i = 0; i < n; i++) ins.push({ x: x - 32, y: startY + i * spacing });
+    return [...ins, ...out];
+  }
+  if (c.type === 'input') return [{ x: x + 22, y }];
+  // 2단자 회로부품
+  return [{ x: x - 32, y }, { x: x + 32, y }];
+}
+
+// ============================================================
+// 툴바
+// ============================================================
+const TOOLS = {
+  circuit: [
+    { group: '기본' },
+    { id:'select', label:'선택' },
+    { id:'wire',   label:'배선' },
+    { id:'battery',label:'🔋 전지', special:true },
+    { id:'cap',    label:'🧢 캡',   special:true },
+    { id:'resistor',label:'저항' },
+    { id:'led',    label:'LED' },
+    { id:'vsource',label:'전압원' },
+    { id:'ammeter',label:'전류계' },
+    { id:'switch', label:'스위치' },
+  ],
+  logic: [
+    { group: '기본' },
+    { id:'select', label:'선택' },
+    { id:'wire',   label:'배선' },
+    { id:'input',  label:'입력' },
+    { id:'and',    label:'AND' },
+    { id:'or',     label:'OR' },
+    { id:'not',    label:'NOT' },
+    { id:'nand',   label:'NAND' },
+    { id:'nor',    label:'NOR' },
+    { id:'xor',    label:'XOR' },
+    { id:'xnor',   label:'XNOR' },
+    { id:'led',    label:'LED' },
+    { group: '특수' },
+    { id:'buf',    label:'BUF',    special:true },
+    { id:'and3',   label:'AND3',   special:true },
+    { id:'or3',    label:'OR3',    special:true },
+    { id:'nand3',  label:'NAND3',  special:true },
+    { id:'nor3',   label:'NOR3',   special:true },
+    { id:'xor3',   label:'XOR3',   special:true },
+    { id:'tri',    label:'TRI',    special:true },
+    { id:'dff',    label:'DFF',    special:true },
+    { id:'tff',    label:'TFF',    special:true },
+    { id:'jkff',   label:'JKFF',   special:true },
+    { id:'sr',     label:'SR',     special:true },
+    { id:'seg7',   label:'7SEG',   special:true },
+  ],
+};
+
+function buildToolbar() {
+  const box = document.getElementById('tools');
+  box.innerHTML = '';
+  TOOLS[state.mode].forEach(t => {
+    if (t.group) {
+      const s = document.createElement('span');
+      s.className = 'group-label';
+      s.textContent = t.group;
+      box.appendChild(s);
+      return;
+    }
+    const b = document.createElement('button');
+    b.className = 'btn' + (state.tool === t.id ? ' active' : '') + (t.special ? ' special' : '');
+    b.textContent = t.label;
+    b.dataset.tool = t.id;
+    b.onclick = () => { state.tool = t.id; state.wireStart = null; buildToolbar(); };
+    box.appendChild(b);
+  });
+  hintEl.textContent = state.mode === 'circuit'
+    ? '부품 클릭=배치 · 스위치 클릭=토글 · 배선툴: 두 단자 클릭'
+    : '입력 클릭=토글 · 게이트=배치 · 배선툴: 두 단자 클릭 · FF는 CLK 상승엣지';
+}
+
+document.querySelectorAll('.mode button').forEach(b => {
+  b.onclick = () => {
+    state.mode = b.dataset.mode;
+    state.tool = 'select';
+    state.wireStart = null;
+    state.selected = null;
+    document.querySelectorAll('.mode button').forEach(x => x.classList.toggle('active', x === b));
+    state.comps = state.comps.filter(c => {
+      const isLogicComp = isLogicType(c.type);
+      return state.mode === 'logic' ? isLogicComp : !isLogicComp;
+    });
+    state.nodes = [];
+    buildToolbar();
+    if (state.mode === 'circuit') simulate(); else runLogic();
+    draw();
+  };
+});
+
+document.getElementById('clearBtn').onclick = () => {
+  state.comps = []; state.nodes = []; state.selected = null; state.wireStart = null;
+  state.sim = { currents: {}, voltages: null, nodeVal: {} };
+  statusEl.textContent = '초기화됨';
+  draw();
+};
+
+// ============================================================
+// 입력 처리
+// ============================================================
+canvas.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  const mx = e.clientX, my = e.clientY;
+
+  const hitComp = state.comps.find(c => Math.hypot(c.x - mx, c.y - my) < 36);
+  const hitNode = state.nodes.findIndex(n => Math.hypot(n.x - mx, n.y - my) < 12);
+
+  if (state.tool === 'select') {
+    if (hitComp) {
+      state.selected = { type:'comp', ref: hitComp };
+      state.drag = { comp: hitComp, ox: hitComp.x - mx, oy: hitComp.y - my };
+      if (hitComp.type === 'input') { hitComp.out = !hitComp.out; runLogic(); }
+      else if (hitComp.type === 'switch') { hitComp.closed = !hitComp.closed; simulate(); }
+      draw(); return;
+    }
+    state.selected = null;
+    draw();
+    return;
+  }
+
+  if (state.tool === 'wire') {
+    let ref = null;
+    if (hitComp) {
+      const ts = terminals(hitComp);
+      for (let i = 0; i < ts.length; i++) {
+        if (Math.hypot(ts[i].x - mx, ts[i].y - my) < 16) { ref = { kind:'term', comp: hitComp, i }; break; }
+      }
+    }
+    if (!ref && hitNode >= 0) ref = { kind:'node', idx: hitNode };
+    if (!ref) return;
+    if (!state.wireStart) { state.wireStart = ref; statusEl.textContent = '배선 시작…'; }
+    else { connect(state.wireStart, ref); state.wireStart = null;
+      if (state.mode === 'circuit') simulate(); else runLogic();
+    }
+    draw(); return;
+  }
+
+  // 배치
+  const canPlaceCircuit = state.mode === 'circuit' && ['battery','cap','resistor','led','vsource','ammeter','switch'].includes(state.tool);
+  const canPlaceLogic = state.mode === 'logic' && (isLogicType(state.tool) || state.tool === 'led');
+  if (canPlaceCircuit || canPlaceLogic) {
+    const c = addComp(state.tool, mx, my);
+    if (state.mode === 'circuit') simulate(); else runLogic();
+    draw();
+  }
+});
+
+canvas.addEventListener('mousemove', e => {
+  lastMouse.x = e.clientX; lastMouse.y = e.clientY;
+  if (state.drag) {
+    state.drag.comp.x = snap(e.clientX + state.drag.ox);
+    state.drag.comp.y = snap(e.clientY + state.drag.oy);
+    if (state.mode === 'circuit') simulate();
+    draw();
+  } else if (state.wireStart) {
+    draw();
+  }
+});
+canvas.addEventListener('mouseup', () => { state.drag = null; });
+
+function connect(a, b) {
+  const na = resolveNode(a), nb = resolveNode(b);
+  if (na < 0 || nb < 0 || na === nb) return;
+  const c = addComp('wire', (state.nodes[na].x + state.nodes[nb].x)/2, (state.nodes[na].y + state.nodes[nb].y)/2);
+  c.n = [na, nb];
+}
+function resolveNode(ref) {
+  if (ref.kind === 'node') return ref.idx;
+  const c = ref.comp;
+  const ts = terminals(c);
+  const t = ts[ref.i];
+  const idx = ensureNode(t.x, t.y);
+  while (c.n.length <= ref.i) c.n.push(null);
+  c.n[ref.i] = idx;
+  return idx;
+}
+
+// ============================================================
+// 회로 시뮬레이션 (MNA 근사)
+// ============================================================
+function simulate() {
+  const nodes = state.nodes;
+  const N = nodes.length;
+  if (N === 0) { state.sim = { currents:{}, voltages:null, nodeVal:{} }; updateStatus(); draw(); return; }
+
+  const gnd = 0;
+  const G = Array.from({length:N}, () => new Float64Array(N));
+  const I = new Float64Array(N);
+
+  const stamps = [];
+  for (const c of state.comps) {
+    if (c.type === 'wire') {
+      const [a, b] = c.n; if (a==null||b==null) continue;
+      const g = 1e3; stampG(G, a, b, g); stamps.push({c, a, b, g});
+    } else if (c.type === 'resistor') {
+      const [a, b] = c.n; if (a==null||b==null) continue;
+      const g = 1 / Math.max(0.01, c.val);
+      stampG(G, a, b, g); stamps.push({c, a, b, g});
+    } else if (c.type === 'led') {
+      const [a, b] = c.n; if (a==null||b==null) continue;
+      const g = 1 / 20;
+      stampG(G, a, b, g); stamps.push({c, a, b, g, led:true});
+    } else if (c.type === 'ammeter') {
+      const [a, b] = c.n; if (a==null||b==null) continue;
+      const g = 1e3; stampG(G, a, b, g); stamps.push({c, a, b, g, ammeter:true});
+    } else if (c.type === 'switch') {
+      const [a, b] = c.n; if (a==null||b==null) continue;
+      if (c.closed) { const g = 1e3; stampG(G, a, b, g); stamps.push({c, a, b, g}); }
+    }
+  }
+
+  const vSources = state.comps.filter(c => (c.type==='battery'||c.type==='vsource') && c.n.length>=2 && c.n[0]!=null && c.n[1]!=null);
+  const largeG = 1e3;
+  for (const v of vSources) {
+    const [p, n] = v.n;
+    stampG(G, p, n, largeG);
+    const iSrc = v.val * largeG;
+    I[p] += iSrc; I[n] -= iSrc;
+  }
+
+  // 행렬 풀이 (gnd 제외)
+  const unknowns = N - 1;
+  if (unknowns <= 0) {
+    state.sim = { currents:{}, voltages:new Float64Array(N), nodeVal:{} };
+    updateStatus(); draw(); return;
+  }
+  const A = [], B = [];
+  for (let i = 1; i < N; i++) {
+    const row = new Float64Array(unknowns);
+    for (let j = 1; j < N; j++) row[j-1] = G[i][j];
+    A.push(row); B.push(I[i]);
+  }
+  const V = gaussSolve(A, B);
+  if (!V) { state.sim = { currents:{}, voltages:null, nodeVal:{} }; updateStatus('⚠ 해를 찾을 수 없음'); draw(); return; }
+  const volts = new Float64Array(N);
+  for (let i = 1; i < N; i++) volts[i] = V[i-1];
+
+  const currents = {};
+  for (const s of stamps) {
+    const dv = volts[s.a] - volts[s.b];
+    const cur = dv * s.g;
+    currents[s.c.id] = cur;
+    if (s.led) s.c.lit = Math.max(0, Math.min(1, (dv - 1.8) / 1.5));
+    if (s.ammeter) s.c.val = cur;
+  }
+  for (const c of state.comps) if (c.type === 'led' && !(c.id in currents)) c.lit = 0;
+
+  state.sim = { currents, voltages: volts, nodeVal: {} };
+  updateStatus();
+  draw();
+}
+function stampG(G, a, b, g) {
+  if (a != null) G[a][a] += g;
+  if (b != null) G[b][b] += g;
+  if (a != null && b != null) { G[a][b] -= g; G[b][a] -= g; }
+}
+function gaussSolve(A, B) {
+  const n = B.length;
+  if (n === 0) return [];
+  const M = A.map((row, i) => [...row, B[i]]);
+  for (let i = 0; i < n; i++) {
+    let p = i;
+    for (let r = i+1; r < n; r++) if (Math.abs(M[r][i]) > Math.abs(M[p][i])) p = r;
+    if (Math.abs(M[p][i]) < 1e-9) return null;
+    [M[i], M[p]] = [M[p], M[i]];
+    const piv = M[i][i];
+    for (let j = i; j <= n; j++) M[i][j] /= piv;
+    for (let r = 0; r < n; r++) {
+      if (r === i) continue;
+      const f = M[r][i];
+      if (f === 0) continue;
+      for (let j = i; j <= n; j++) M[r][j] -= f * M[i][j];
+    }
+  }
+  return M.map(row => row[n]);
+}
+
+// ============================================================
+// 논리 시뮬레이션 (위상 순서 반복)
+// ============================================================
+function runLogic() {
+  const comps = state.comps;
+  const nodeVal = {};
+
+  // 입력 초기값
+  for (const c of comps) {
+    if (c.type === 'input' && c.n[0] != null) {
+      nodeVal[c.n[0]] = c.out ? 1 : 0;
+    }
+  }
+
+  // 와이어로 연결된 노드 그룹화 (union-find)
+  const parent = {};
+  const find = x => { while (parent[x] !== undefined && parent[x] !== x) x = parent[x]; return x; };
+  const union = (a, b) => {
+    if (a == null || b == null) return;
+    if (parent[a] === undefined) parent[a] = a;
+    if (parent[b] === undefined) parent[b] = b;
+    parent[find(a)] = find(b);
+  };
+  for (const c of comps) if (c.type === 'wire' && c.n[0] != null && c.n[1] != null) union(c.n[0], c.n[1]);
+  for (const c of comps) {
+    // 게이트 출력도 노드로 통합
+    c.n.forEach(ni => { if (ni != null && parent[ni] === undefined) parent[ni] = ni; });
+  }
+
+  const getVal = ni => ni == null ? 0 : (nodeVal[find(ni)] || nodeVal[ni] || 0);
+  const setVal = (ni, v) => {
+    if (ni == null) return false;
+    const root = find(ni);
+    const old = nodeVal[root] ?? 0;
+    if (old !== v) { nodeVal[root] = v; nodeVal[ni] = v; return true; }
+    nodeVal[ni] = v;
+    return false;
+  };
+  // 입력값 재적용
+  for (const c of comps) {
+    if (c.type === 'input' && c.n[0] != null) setVal(c.n[0], c.out ? 1 : 0);
+  }
+
+  let changed = true, iter = 0;
+  while (changed && iter++ < 50) {
+    changed = false;
+    for (const c of comps) {
+      if (c.type === 'input' || c.type === 'wire') continue;
+
+      if (isGate(c.type)) {
+        const def = GATE_DEFS[c.type];
+        const ins = [];
+        for (let i = 0; i < def.inputs; i++) ins.push(getVal(c.n[i]));
+        const outIdx = def.inputs; // 마지막 단자가 출력
+        let val = 0;
+        const clk = ins[def.inputs - 1]; // 마지막 입력이 CLK (FF의 경우)
+
+        switch (c.type) {
+          case 'and':  val = ins[0] & ins[1]; break;
+          case 'or':   val = ins[0] | ins[1]; break;
+          case 'not':  val = ins[0] ? 0 : 1; break;
+          case 'nand': val = (ins[0] & ins[1]) ? 0 : 1; break;
+          case 'nor':  val = (ins[0] | ins[1]) ? 0 : 1; break;
+          case 'xor':  val = ins[0] ^ ins[1]; break;
+          case 'xnor': val = ins[0] ^ ins[1] ? 0 : 1; break;
+          case 'buf':  val = ins[0]; break;
+          case 'and3': val = ins[0] & ins[1] & ins[2]; break;
+          case 'or3':  val = ins[0] | ins[1] | ins[2]; break;
+          case 'nand3':val = (ins[0] & ins[1] & ins[2]) ? 0 : 1; break;
+          case 'nor3': val = (ins[0] | ins[1] | ins[2]) ? 0 : 1; break;
+          case 'xor3': val = ins[0] ^ ins[1] ^ ins[2]; break;
+          case 'tri':  // ins[0]=data, ins[1]=enable
+            val = ins[1] ? ins[0] : 0; break;
+          case 'dff': {
+            const D = ins[0], CLK = ins[1];
+            const rising = CLK && !c.prevClk;
+            c.prevClk = !!CLK;
+            if (rising) c.state = D ? 1 : 0;
+            val = c.state;
+            break;
+          }
+          case 'tff': {
+            const T = ins[0], CLK = ins[1];
+            const rising = CLK && !c.prevClk;
+            c.prevClk = !!CLK;
+            if (rising && T) c.state = c.state ? 0 : 1;
+            val = c.state;
+            break;
+          }
+          case 'jkff': {
+            const J = ins[0], K = ins[1], CLK = ins[2];
+            const rising = CLK && !c.prevClk;
+            c.prevClk = !!CLK;
+            if (rising) {
+              if (J && !K) c.state = 1;
+              else if (!J && K) c.state = 0;
+              else if (J && K) c.state = c.state ? 0 : 1;
+            }
+            val = c.state;
+            break;
+          }
+          case 'sr': {
+            const S = ins[0], R = ins[1];
+            if (S && !R) c.state = 1;
+            else if (!S && R) c.state = 0;
+            else if (!S && !R) {} // 유지
+            else c.state = 0; // 둘 다 1 = 금지, 0으로
+            val = c.state;
+            break;
+          }
+          case 'seg7': {
+            // 4bit → 7seg (입력 = b0,b1,b2,b3)
+            const v = (ins[0]) | (ins[1]<<1) | (ins[2]<<2) | (ins[3]<<3);
+            c.segBits = v & 0xF;
+            val = 0;
+            break;
+          }
+        }
+        if (setVal(c.n[outIdx], val)) changed = true;
+        c.out = !!val;
+      } else if (c.type === 'led') {
+        c.lit = getVal(c.n[0]) ? 1 : 0;
+      }
+    }
+  }
+
+  state.sim.nodeVal = nodeVal;
+  updateStatus();
+  draw();
+}
+
+// ============================================================
+// 클럭 (수동 토글 버튼)
+// ============================================================
+function pulseClock() {
+  // 모든 클럭 생성기: 2단자 clock 부품
+  // 여기서는 각 FF의 CLK 입력에 붙은 input을 잠시 토글했다가 되돌림
+  // 단순화: input 중 이름이 CLK인 것을 토글
+  for (const c of state.comps) {
+    if (c.type === 'input') {
+      // 잠깐 반대값
+      c.out = !c.out;
+    }
+  }
+  runLogic();
+  setTimeout(() => {
+    for (const c of state.comps) if (c.type === 'input') c.out = !c.out;
+    runLogic();
+  }, 30);
+}
+addEventListener('keydown', e => {
+  if (e.key === ' ' && state.mode === 'logic') { e.preventDefault(); pulseClock(); }
+  if (e.key === 'Delete' && state.selected?.type === 'comp') {
+    const c = state.selected.ref;
+    state.comps = state.comps.filter(x => x !== c);
+    state.selected = null;
+    if (state.mode === 'circuit') simulate(); else runLogic();
+    draw();
+  }
+});
+
+// ============================================================
+// 렌더링
+// ============================================================
+function draw() {
+  ctx.fillStyle = '#0f1115';
+  ctx.fillRect(0, 0, W, H);
+
+  // 그리드
+  ctx.strokeStyle = '#161a20'; ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += GRID) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y = 0; y < H; y += GRID) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+  for (const c of state.comps) if (c.type === 'wire') drawWire(c);
+
+  // 노드에 연결된 값 표시 (논리)
+  if (state.mode === 'logic') {
+    for (const n of state.nodes) {
+      // 노드 값 조회
+      const v = state.sim.nodeVal?.[n.x] ?? state.sim.nodeVal?.[n.y];
+      // (간단히 생략)
+    }
+  }
+
+  for (const c of state.comps) if (c.type !== 'wire') drawComp(c);
+
+  // 노드 점
+  for (const n of state.nodes) {
+    ctx.fillStyle = '#4b5563';
+    ctx.beginPath(); ctx.arc(n.x, n.y, 3, 0, Math.PI*2); ctx.fill();
+  }
+
+  if (state.selected?.type === 'comp') {
+    const c = state.selected.ref;
+    ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(c.x, c.y, 38, 0, Math.PI*2); ctx.stroke();
+  }
+
+  if (state.wireStart) {
+    let px, py;
+    if (state.wireStart.kind === 'node') { px = state.nodes[state.wireStart.idx].x; py = state.nodes[state.wireStart.idx].y; }
+    else { const t = terminals(state.wireStart.comp)[state.wireStart.i]; px = t.x; py = t.y; }
+    ctx.strokeStyle = '#f59e0b'; ctx.setLineDash([6,4]); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(lastMouse.x, lastMouse.y); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+let lastMouse = { x: 0, y: 0 };
+
+function drawWire(c) {
+  if (c.n[0] == null || c.n[1] == null) return;
+  const a = state.nodes[c.n[0]], b = state.nodes[c.n[1]];
+  if (!a || !b) return;
+  ctx.strokeStyle = '#6b7280'; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+}
+
+function drawComp(c) {
+  const { x, y, type } = c;
+
+  // ===== 회로 부품 =====
+  if (type === 'battery' || type === 'vsource') {
+    ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x-32,y); ctx.lineTo(x-10,y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x+32,y); ctx.lineTo(x+10,y); ctx.stroke();
+    ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(x-6,y-14); ctx.lineTo(x-6,y+14); ctx.stroke();
+    ctx.strokeStyle = '#3b82f6';
+    ctx.beginPath(); ctx.moveTo(x+6,y-20); ctx.lineTo(x+6,y+20); ctx.stroke();
+    ctx.fillStyle = '#9ca3af'; ctx.font = '11px ui-monospace'; ctx.textAlign='center';
+    ctx.fillText(c.val + 'V', x, y+34);
+    const cur = state.sim.currents?.[c.id] || 0;
+    if (Math.abs(cur) > 1e-4) {
+      ctx.fillStyle = '#fbbf24'; ctx.font = '10px ui-monospace';
+      ctx.fillText((cur > 0 ? '+' : '') + (cur*1000).toFixed(1) + 'mA', x, y-30);
+    }
+    return;
+  }
+  if (type === 'cap') {
+    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 2;
+    ctx.strokeRect(x-22, y-16, 44, 32);
+    ctx.beginPath(); ctx.moveTo(x-32,y); ctx.lineTo(x-22,y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x+22,y); ctx.lineTo(x+32,y); ctx.stroke();
+    ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 1.5;
+    for (let i=-14; i<=14; i+=6) {
+      ctx.beginPath(); ctx.moveTo(x+i, y-6); ctx.lineTo(x+i+3, y+6); ctx.stroke();
+    }
+    ctx.fillStyle = '#9ca3af'; ctx.font = '10px ui-monospace'; ctx.textAlign='center';
+    ctx.fillText('캡', x, y+32);
+    return;
+  }
+  if (type === 'resistor') {
+    ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x-32,y); ctx.lineTo(x-18,y); ctx.stroke();
+    ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 3;
+    ctx.strokeRect(x-18, y-8, 36, 16);
+    ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x+18,y); ctx.lineTo(x+32,y); ctx.stroke();
+    ctx.fillStyle = '#9ca3af'; ctx.font = '11px ui-monospace'; ctx.textAlign='center';
+    ctx.fillText(c.val + 'Ω', x, y+28);
+    return;
+  }
+  if (type === 'led') {
+    const lit = c.lit || 0;
+    if (lit > 0.05) {
+      const grad = ctx.createRadialGradient(x, y, 2, x, y, 50);
+      const col = state.mode === 'logic' ? '34,197,94' : '239,68,68';
+      grad.addColorStop(0, `rgba(${col},${lit})`);
+      grad.addColorStop(1, `rgba(${col},0)`);
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(x,y,50,0,Math.PI*2); ctx.fill();
+    }
+    ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x-32,y); ctx.lineTo(x-10,y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x+32,y); ctx.lineTo(x+10,y); ctx.stroke();
+    ctx.fillStyle = lit > 0.05 ? `rgb(${Math.round(239*lit)}, ${Math.round(68*lit)}, ${Math.round(68*lit)})` : '#374151';
+    ctx.beginPath();
+    ctx.moveTo(x-10, y-10); ctx.lineTo(x+10, y); ctx.lineTo(x-10, y+10); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = lit > 0.05 ? '#fca5a5' : '#6b7280'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x+10,y-11); ctx.lineTo(x+10,y+11); ctx.stroke();
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(x+14,y-8); ctx.lineTo(x+22,y-16); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x+14,y+8); ctx.lineTo(x+22,y+16); ctx.stroke();
+    return;
+  }
+  if (type === 'ammeter') {
+    ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x-32,y); ctx.lineTo(x-18,y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x+18,y); ctx.lineTo(x+32,y); ctx.stroke();
+    ctx.fillStyle = '#1e293b'; ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x,y,18,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#93c5fd'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('A', x, y);
+    ctx.textBaseline = 'alphabetic';
+    const cur = c.val || 0;
+    ctx.fillStyle = '#fbbf24'; ctx.font = '10px ui-monospace';
+    ctx.fillText((cur*1000).toFixed(2)+'mA', x, y+32);
+    return;
+  }
+  if (type === 'switch') {
+    ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x-32,y); ctx.lineTo(x-14,y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x+14,y); ctx.lineTo(x+32,y); ctx.stroke();
+    ctx.fillStyle = '#374151';
+    ctx.beginPath(); ctx.arc(x-14,y,3,0,7); ctx.fill();
+    ctx.beginPath(); ctx.arc(x+14,y,3,0,7); ctx.fill();
+    ctx.strokeStyle = c.closed ? '#22c55e' : '#ef4444'; ctx.lineWidth = 3;
+    ctx.beginPath();
+    if (c.closed) { ctx.moveTo(x-14,y); ctx.lineTo(x+14,y); }
+    else { ctx.moveTo(x-14,y); ctx.lineTo(x+12,y-14); }
+    ctx.stroke();
+    return;
+  }
+
+  // ===== 논리 부품 =====
+  if (type === 'input') {
+    ctx.fillStyle = c.out ? '#22c55e' : '#374151';
+    ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.roundRect(x-22, y-16, 44, 32, 6); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(c.out ? '1' : '0', x, y);
+    ctx.textBaseline = 'alphabetic';
+    return;
+  }
+  if (isGate(type)) {
+    drawGate(c);
+    return;
+  }
+}
+
+function drawGate(c) {
+  const { x, y, type } = c;
+  const def = GATE_DEFS[type];
+  const special = def.kind === 'special';
+
+  // 몸체
+  ctx.fillStyle = special ? '#2a1b3d' : '#1e293b';
+  ctx.strokeStyle = special ? '#a855f7' : '#3b82f6';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(x-24, y-24, 48, 48, 8);
+  ctx.fill(); ctx.stroke();
+
+  // 라벨
+  ctx.fillStyle = special ? '#e9d5ff' : '#bfdbfe';
+  ctx.font = 'bold 11px ui-monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const label = type.toUpperCase();
+  ctx.fillText(label, x, y);
+  ctx.textBaseline = 'alphabetic';
+
+  // 상태 표시 (출력)
+  const outOn = c.out;
+  ctx.fillStyle = outOn ? '#22c55e' : '#374151';
+  ctx.beginPath(); ctx.arc(x + 32, y, 4, 0, Math.PI*2); ctx.fill();
+
+  // 입출력 단자
+  const ts = terminals(c);
+  for (let i = 0; i < ts.length; i++) {
+    const isOutput = i === def.inputs;
+    ctx.fillStyle = isOutput ? '#22c55e' : '#9ca3af';
+    ctx.beginPath(); ctx.arc(ts[i].x, ts[i].y, 3, 0, Math.PI*2); ctx.fill();
+  }
+
+  // 세그먼트 표시
+  if (type === 'seg7') {
+    drawSeg7(x, y, c.segBits || 0);
+  }
+
+  // FF 상태 미니 표시
+  if (['dff','tff','jkff','sr'].includes(type)) {
+    ctx.fillStyle = c.state ? '#22c55e' : '#6b7280';
+    ctx.font = '10px ui-monospace'; ctx.textAlign = 'center';
+    ctx.fillText(c.state ? 'Q=1' : 'Q=0', x, y + 34);
+  }
+}
+
+function drawSeg7(cx, cy, val) {
+  // val 0..15 → 7세그먼트
+  const segMap = {
+    0: 0b0111111, 1: 0b0000110, 2: 0b1011011, 3: 0b1001111,
+    4: 0b1100110, 5: 0b1101101, 6: 0b1111101, 7: 0b0000111,
+    8: 0b1111111, 9: 0b1101111, 10: 0b1110111, 11: 0b1111100,
+    12: 0b0111001, 13: 0b1011110, 14: 0b1111001, 15: 0b1110001,
+  };
+  const bits = segMap[val] || 0;
+  // a=bit0, b=bit1, c=bit2, d=bit3, e=bit4, f=bit5, g=bit6
+  const segs = [
+    { bit:0, x1:cx-10, y1:cy-24, x2:cx+10, y2:cy-24 }, // a
+    { bit:1, x1:cx+10, y1:cy-24, x2:cx+10, y2:cy-4 },  // b
+    { bit:2, x1:cx+10, y1:cy+4,  x2:cx+10, y2:cy+24 }, // c
+    { bit:3, x1:cx-10, y1:cy+24, x2:cx+10, y2:cy+24 }, // d
+    { bit:4, x1:cx-10, y1:cy+4,  x2:cx-10, y2:cy+24 }, // e
+    { bit:5, x1:cx-10, y1:cy-24, x2:cx-10, y2:cy-4 },  // f
+    { bit:6, x1:cx-10, y1:cy,    x2:cx+10, y2:cy },    // g
+  ];
+  ctx.lineCap = 'round';
+  for (const s of segs) {
+    const on = (bits >> s.bit) & 1;
+    ctx.strokeStyle = on ? '#ef4444' : '#2d1b1b';
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(s.x1, s.y1); ctx.lineTo(s.x2, s.y2); ctx.stroke();
+  }
+  // 숫자 텍스트
+  ctx.fillStyle = '#fbbf24'; ctx.font = 'bold 10px ui-monospace'; ctx.textAlign = 'center';
+  ctx.fillText(val.toString(16).toUpperCase(), cx, cy + 42);
+}
+
+// ============================================================
+// 상태 표시줄
+// ============================================================
+function updateStatus() {
+  if (state.mode === 'circuit') {
+    const N = state.nodes.length;
+    const v = state.sim.voltages;
+    const maxV = v ? Math.max(...Array.from(v).map(Math.abs)) : 0;
+    statusEl.textContent =
+      `회로 · 노드 ${N} · 부품 ${state.comps.filter(c=>c.type!=='wire').length} · 최대전압 ${maxV.toFixed(2)}V`;
+  } else {
+    const gates = state.comps.filter(c => isGate(c.type)).length;
+    const onGates = state.comps.filter(c => isGate(c.type) && c.out).length;
+    statusEl.textContent =
+      `논리 · 게이트 ${gates} · 출력ON ${onGates} · 입력 ${state.comps.filter(c=>c.type==='input').length} · [Space]=클럭`;
+  }
+}
+
+// ============================================================
+// 초기화
+// ============================================================
+resize();
+buildToolbar();
+simulate();
+</script>
+</body>
+</html>
