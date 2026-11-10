@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>회로 시뮬레이터 (커패시터 & 배선 자동 정리)</title>
+<title>회로 시뮬레이션</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1115; color: #e5e7eb; overflow: hidden; user-select: none; }
@@ -277,17 +277,21 @@ function startSimLoop() {
     if (state.mode !== 'circuit') return;
     let needUpdate = false;
     for (const c of state.comps) {
-      if (c.type === 'cap' && !c.broken) {
+            if (c.type === 'cap' && !c.broken) {
         // 캡 양단 전압 구하기
         const v = state.sim.voltages;
         if (!v || c.n[0] == null || c.n[1] == null) continue;
         const dv = v[c.n[0]] - v[c.n[1]];
         
-        // 가상의 충방전 커브 (전압이 변할 때 서서히 따라감)
+        // 가상의 충방전 커브
         const target = dv;
         const diff = target - c.charge;
         if (Math.abs(diff) > 0.01) {
-          c.charge += diff * 0.1; // 스무딩 계수 (충방전 속도)
+          c.charge += diff * 0.1; 
+          
+          // 🚨 [핵심 수정] 캡 전압이 회로의 최대 전압(예: 5V)을 넘지 못하게 제한!
+          if (c.charge > 5.0) c.charge = 5.0; 
+          
           needUpdate = true;
         }
       }
